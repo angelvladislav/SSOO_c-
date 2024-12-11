@@ -15,7 +15,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <expected>
-#include <arpa/inet.h>
 
 class SafeFD {
 public:
@@ -35,28 +34,17 @@ private:
 
 bool verbose = false;
 int port = 8080;
-std::string base_path;  // Ruta base para los archivos
+std::string base_path;
 bool check_file_size = false;
 
 const size_t tam_buffer = 256;
 
-int send_response(const SafeFD& socket, std::string_view header, std::string_view body = {}) {
-    // Construir la respuesta completa
+void send_response(int client_sock, std::string_view header, std::string_view body = {}) {
     std::string response = std::string(header) + "\r\n\r\n" + std::string(body);
-
-    // Enviar la respuesta a través del socket
-    ssize_t bytes_sent = send(socket.value(), response.c_str(), response.size(), 0);
-    if (bytes_sent == -1) {
-        std::cerr << "Error al enviar la respuesta: " << strerror(errno) << std::endl;
-        return errno;
-    }
-
-    // Si verbose está activado, mostramos información de la respuesta enviada
     if (verbose) {
         std::cout << "Enviando respuesta: " << response.substr(0, 100) << "..." << std::endl;
     }
-
-    return 0; // Indica éxito
+    send(client_sock, response.c_str(), response.size(), 0);
 }
 
 std::string read_file(const std::string& path) {
@@ -81,12 +69,73 @@ std::string read_file(const std::string& path) {
     return body;
 }
 
-// Función para configurar las variables de entorno
-void set_environment_vars(const std::string& request_path, const std::string& base_dir, uint16_t remote_port, const std::string& remote_ip) {
-    setenv("REQUEST_PATH", request_path.c_str(), 1);  // Configurar REQUEST_PATH
-    setenv("SERVER_BASEDIR", base_dir.c_str(), 1);    // Configurar SERVER_BASEDIR
-    setenv("REMOTE_PORT", std::to_string(remote_port).c_str(), 1);  // Configurar REMOTE_PORT
-    setenv("REMOTE_IP", remote_ip.c_str(), 1);        // Configurar REMOTE_IP
+struct execute_program_error {
+    int exit_code;
+    int error_code;
+};
+
+struct exec_environment {
+    std::string path;
+    std::vector<std::string> env_vars;
+};
+
+std::expected<std::string, execute_program_error> execute_program(const std::string& path, const exec_environment& env) {
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        return std::unexpected({-1, errno});
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        return std::unexpected({-1, errno});
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+
+        if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
+            close(pipefd[1]);
+            exit(EXIT_FAILURE);
+        }
+
+        if (!env.env_vars.empty()) {
+            for (const auto& var : env.env_vars) {
+                putenv(const_cast<char*>(var.c_str()));
+            }
+        }
+
+        execlp(path.c_str(), path.c_str(), (char*)nullptr);
+
+        close(pipefd[1]);
+        exit(EXIT_FAILURE);
+    } else {
+        close(pipefd[1]);
+
+        int status;
+        if (waitpid(pid, &status, 0) == -1) {
+            close(pipefd[0]);
+            return std::unexpected({-1, errno});
+        }
+
+        if (WIFEXITED(status)) {
+            if (WEXITSTATUS(status) == EXIT_SUCCESS) {
+                std::string result;
+                char buffer[256];
+                ssize_t nbytes;
+                while ((nbytes = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
+                    result.append(buffer, nbytes);
+                }
+                close(pipefd[0]);
+                return result;
+            } else {
+                close(pipefd[0]);
+                return std::unexpected({WEXITSTATUS(status), 0});
+            }
+        } else {
+            close(pipefd[0]);
+            return std::unexpected({-1, 0});
+        }
+    }
 }
 
 std::expected<void, int> parse_args(int argc, char* argv[]) {
@@ -117,7 +166,6 @@ std::expected<void, int> parse_args(int argc, char* argv[]) {
         }
     }
 
-    // Si no se especifica base_path, usa el valor de la variable de entorno o el directorio actual
     if (base_path.empty()) {
         const char* env_base = std::getenv("DOCSERVER_BASEDIR");
         if (env_base) {
@@ -177,7 +225,7 @@ std::expected<std::string, int> receive_request(const SafeFD& socket, size_t max
     if (bytes_received == -1) {
         return std::unexpected(errno);
     }
-    request.resize(bytes_received); // Ajustamos al tamaño real de la petición recibida
+    request.resize(bytes_received);
     return request;
 }
 
@@ -213,11 +261,11 @@ int main(int argc, char* argv[]) {
         }
 
         pid_t pid = fork();
-        if (pid == 0) { // Proceso hijo
-            close(sockfd.value());  // El hijo no necesita el socket del servidor
+        if (pid == 0) {
+            close(sockfd.value());
 
             std::string request;
-            auto request_result = receive_request(client_sock.value(), 1024);  // Maximo de 1024 bytes
+            auto request_result = receive_request(client_sock.value(), 1024);
             if (!request_result) {
                 std::cerr << "Error al recibir la solicitud: " << strerror(request_result.error()) << std::endl;
                 send_response(client_sock.value(), "HTTP/1.1 400 Bad Request", "Error al recibir la solicitud.");
@@ -236,25 +284,53 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
 
-            // Configurar las variables de entorno
-            set_environment_vars(file_path, base_path, ntohs(client_addr.sin_port), inet_ntoa(client_addr.sin_addr));
+            if (file_path.starts_with("/cgi-bin/")) {
+                auto exec_path = base_path + file_path;
+                auto result = execute_program(exec_path, {exec_path, {}});
+                if (!result) {
+                    if (result.error().exit_code == -1 && result.error().error_code == ENOENT) {
+                        send_response(client_sock.value(), "HTTP/1.1 404 Not Found", "Archivo no encontrado.");
+                    } else if (result.error().exit_code == -1 && result.error().error_code == EACCES) {
+                        send_response(client_sock.value(), "HTTP/1.1 403 Forbidden", "Acceso denegado.");
+                    } else {
+                        std::cerr << "Error en la ejecución del programa: " << strerror(result.error().error_code) << std::endl;
+                        send_response(client_sock.value(), "HTTP/1.1 500 Internal Server Error", "Error interno del servidor.");
+                    }
+                    close(client_sock.value());
+                    return EXIT_FAILURE;
+                }
 
-            file_path = base_path + file_path;
-            auto body = read_file(file_path);
-            if (body.empty()) {
-                send_response(client_sock.value(), "HTTP/1.1 404 Not Found", "Archivo no encontrado.");
-            } else {
-                send_response(client_sock.value(), "HTTP/1.1 200 OK", body);
+                auto output = result.value();
+                std::ostringstream header;
+                header << "HTTP/1.1 200 OK\r\nContent-Length: " << output.size() << "\r\n\r\n";
+                send_response(client_sock.value(), header.str(), output);
+                close(client_sock.value());
+                return EXIT_SUCCESS;
             }
 
-            close(client_sock.value());  // Cerrar conexión con el cliente
+            file_path = base_path + file_path;
+
+            auto file_result = read_file(file_path);
+            if (file_result.empty()) {
+                send_response(client_sock.value(), "HTTP/1.1 404 Not Found", "Archivo no encontrado.");
+            } else {
+                std::ostringstream header;
+                header << "HTTP/1.1 200 OK\r\nContent-Length: " << file_result.size() << "\r\n\r\n";
+                send_response(client_sock.value(), header.str(), file_result);
+            }
+
+            close(client_sock.value());
             return EXIT_SUCCESS;
-        } else {  // Proceso padre
-            close(client_sock.value());  // El padre no necesita el socket del cliente
-            waitpid(pid, NULL, 0);  // Esperar a que el proceso hijo termine
+        } else if (pid > 0) {
+            close(client_sock.value());
+            waitpid(pid, nullptr, 0);
+        } else {
+            std::cerr << "Error en fork: " << strerror(errno) << std::endl;
+            close(client_sock.value());
+            close(sockfd.value());
+            return EXIT_FAILURE;
         }
     }
 
-    close(sockfd.value());
     return EXIT_SUCCESS;
 }
